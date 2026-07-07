@@ -14,7 +14,9 @@ class TaskRunner:
     def __init__(self):
         self.bot = DiscordAutomator()
         self.accounts = []
-        self.friends = []
+        self.friends = []          # 全部好友
+        self.added_friends = set() # 已添加的好友集合
+        self.friend_index = 0      # 当前好友索引（基于原始列表）
         self.results = {
             "total_accounts": 0,
             "login_success": 0,
@@ -22,6 +24,7 @@ class TaskRunner:
             "total_friend_requests": 0,
             "friend_success": 0,
             "friend_fail": 0,
+            "friend_index": 0,     # 保存当前好友进度
             "details": []
         }
         self.result_file = os.path.join(config.LOG_DIR, "result.json")
@@ -34,7 +37,7 @@ class TaskRunner:
         logger.info("=" * 60)
 
         self.accounts = load_accounts()
-        self.friends = load_friends()
+        self.friends, self.added_friends = load_friends()
 
         if not self.accounts:
             logger.error("没有读取到任何账号，请检查 Excel 文件")
@@ -45,7 +48,9 @@ class TaskRunner:
             return False
 
         logger.info(f"账号数量: {len(self.accounts)}")
-        logger.info(f"好友数量: {len(self.friends)}")
+        logger.info(f"好友总数: {len(self.friends)}")
+        logger.info(f"已添加: {len(self.added_friends)}")
+        logger.info(f"待添加: {len(self.friends) - len(self.added_friends)}")
         logger.info(f"每账号添加: {config.FRIENDS_PER_ACCOUNT} 个")
         return True
 
@@ -56,7 +61,24 @@ class TaskRunner:
         logger.info("=" * 60)
         return self.bot.connect()
 
-    def run_single_account(self, account, friend_list):
+    def _next_friend_batch(self):
+        """获取下一个好友批次，自动跳过已添加的，返回 (batch, actual_start_index)"""
+        batch = []
+        idx = self.friend_index
+        while idx < len(self.friends) and len(batch) < config.FRIENDS_PER_ACCOUNT:
+            name = self.friends[idx]
+            if name not in self.added_friends:
+                batch.append(name)
+            idx += 1
+        return batch
+
+    def _mark_added(self, friend_name):
+        """标记好友为已添加（内存 + 文件）"""
+        self.added_friends.add(friend_name)
+        with open(self.added_file, "a", encoding="utf-8") as f:
+            f.write(friend_name + "\n")
+
+    def run_single_account(self, account):
         """处理单个账号：登录 → 添加好友 → 退出"""
         email = account["email"]
         password = account["password"]
@@ -77,7 +99,7 @@ class TaskRunner:
         # 检查连接，断了就重连
         if not self.bot.ensure_connected():
             logger.error("模拟器连接失败，终止任务")
-            return None  # 返回 None 表示需要终止
+            return None
 
         # ---- 步骤1: 登录 ----
         login_ok = False
@@ -95,7 +117,6 @@ class TaskRunner:
                 logger.fail(f"登录失败: {msg}")
                 result["login_error"] = msg
 
-            # 如果是验证码，直接跳过这个账号
             captcha_keywords = ["验证", "captcha", "Captcha", "人机", "hCaptcha", "recaptcha"]
             if any(kw in msg for kw in captcha_keywords):
                 logger.warning(f"账号 {email} 出现人机验证，跳过")
@@ -117,13 +138,20 @@ class TaskRunner:
 
         # ---- 步骤3: 逐个添加好友 ----
         added_count = 0
-        for idx, friend_name in enumerate(friend_list):
-            if added_count >= config.FRIENDS_PER_ACCOUNT:
-                break
+        while added_count < config.FRIENDS_PER_ACCOUNT and self.friend_index < len(self.friends):
+            # 跳过已添加的
+            if self.friend_index < len(self.friends):
+                friend_name = self.friends[self.friend_index]
+                if friend_name in self.added_friends:
+                    self.friend_index += 1
+                    continue
 
-            logger.info(f"  [{idx + 1}/{len(friend_list)}] 添加 {friend_name}...")
+            friend_name = self.friends[self.friend_index]
+            logger.info(f"  [好友 {self.friend_index + 1}/{len(self.friends)}] 添加 {friend_name}...")
 
             add_ok = False
+            last_msg = ""
+
             for retry in range(config.ADD_FRIEND_MAX_RETRY + 1):
                 if retry > 0:
                     logger.info(f"    重试添加 {friend_name} ({retry}/{config.ADD_FRIEND_MAX_RETRY})...")
@@ -133,38 +161,38 @@ class TaskRunner:
                     add_ok = True
                     break
                 elif msg == "captcha":
-                    # 人机验证，直接退出当前账号
-                    logger.warning(f"    添加好友时出现人机验证，退出当前账号")
                     add_ok = False
+                    last_msg = msg
                     break
                 else:
+                    last_msg = msg
                     logger.debug(f"    添加失败: {msg}")
+
+            self.results["total_friend_requests"] += 1
 
             if add_ok:
                 result["friends_added"].append(friend_name)
                 self.results["friend_success"] += 1
                 added_count += 1
+                self._mark_added(friend_name)
                 logger.success(f"  ✅ {friend_name} 添加成功")
-                # 立即写入已添加好友文件，防止中断丢失
-                with open(self.added_file, "a", encoding="utf-8") as f:
-                    f.write(friend_name + "\n")
+                self.friend_index += 1
             else:
-                if msg == "captcha":
+                if last_msg == "captcha":
                     result["friends_failed"].append({"name": friend_name, "error": "人机验证"})
                     result["captcha_triggered"] = True
                     self.results["friend_fail"] += 1
                     logger.fail(f"  ❌ {friend_name} 人机验证，跳过")
-                    # 直接跳出整个好友添加循环
-                    break
+                    break  # 退出循环，切换账号
                 else:
-                    result["friends_failed"].append({"name": friend_name, "error": msg})
+                    # 非 captcha 失败（如"用户不存在"），跳过这个好友继续下一个
+                    result["friends_failed"].append({"name": friend_name, "error": last_msg})
                     self.results["friend_fail"] += 1
-                    logger.fail(f"  ❌ {friend_name} 添加失败: {msg}")
+                    logger.fail(f"  ❌ {friend_name} 添加失败: {last_msg}")
+                    self.friend_index += 1  # 跳过这个好友
 
-            self.results["total_friend_requests"] += 1
-
-            # 每个好友之间延时
-            if idx < len(friend_list) - 1 and added_count < config.FRIENDS_PER_ACCOUNT:
+            # 好友之间延时
+            if added_count < config.FRIENDS_PER_ACCOUNT and self.friend_index < len(self.friends):
                 self.bot.sleep(config.DELAY_BETWEEN_FRIENDS)
 
         logger.info(f"账号 {email} 完成: 成功 {len(result['friends_added'])}, 失败 {len(result['friends_failed'])}")
@@ -177,7 +205,6 @@ class TaskRunner:
             logger.warning(f"退出登录异常: {e}")
             self.bot.stop_discord()
 
-        # 账号切换延时
         self.bot.sleep(config.DELAY_BETWEEN_ACCOUNTS)
 
         return result
@@ -188,7 +215,7 @@ class TaskRunner:
 
         start_index: 从第几个账号开始（0-based）
         max_accounts: 最多处理多少个账号，None 表示全部
-        friend_start_index: 从第几个好友开始（0-based）
+        friend_start_index: 从第几个好友开始（0-based，基于原始列表）
         """
         if not self.load_data():
             return False
@@ -196,11 +223,14 @@ class TaskRunner:
         if not self.connect_device():
             return False
 
+        self.friend_index = friend_start_index
+
         accounts_to_process = self.accounts[start_index:]
         if max_accounts:
             accounts_to_process = accounts_to_process[:max_accounts]
 
         self.results["total_accounts"] = len(accounts_to_process)
+        self.results["friend_index"] = self.friend_index
         logger.info("")
         logger.info("=" * 60)
         logger.info(f"开始执行任务，共 {len(accounts_to_process)} 个账号")
@@ -209,35 +239,28 @@ class TaskRunner:
         logger.info("=" * 60)
 
         start_time = time.time()
-        consecutive_captcha = 0  # 连续验证计数器
+        consecutive_captcha = 0
 
         for i, account in enumerate(accounts_to_process):
             logger.info(f"\n进度: [{i + 1}/{len(accounts_to_process)}]")
 
-            # 好友列表已全部添加完毕，停止
-            if friend_start_index >= len(self.friends):
+            # 好友列表已全部处理完毕
+            if self.friend_index >= len(self.friends):
                 logger.info("")
                 logger.info("=" * 60)
                 logger.info("所有好友已添加完毕，自动停止!")
                 logger.info("=" * 60)
                 break
 
-            # 计算这个账号要加哪些好友（从当前偏移开始，成功后递增）
-            friend_batch = self.friends[friend_start_index:friend_start_index + config.FRIENDS_PER_ACCOUNT]
-
             try:
-                result = self.run_single_account(account, friend_batch)
-                if result is None:  # 连接失败，终止
+                result = self.run_single_account(account)
+                if result is None:
                     break
+
                 self.results["details"].append(result)
-                # 只推进实际成功添加的好友数量（人机验证时部分好友未添加）
-                if result["login_success"]:
-                    actual_added = len(result["friends_added"])
-                    friend_start_index += actual_added
-                    if actual_added < config.FRIENDS_PER_ACCOUNT:
-                        logger.info(f"本账号仅添加 {actual_added}/{config.FRIENDS_PER_ACCOUNT} 个好友，"
-                                    f"下一个账号从第 {friend_start_index + 1} 个继续")
-                # 连续验证计数器：有验证触发则+1，否则清零
+                self.results["friend_index"] = self.friend_index
+
+                # 连续验证计数器
                 if result.get("captcha_triggered"):
                     consecutive_captcha += 1
                     logger.warning(f"连续验证计数: {consecutive_captcha}/3")
@@ -281,6 +304,7 @@ class TaskRunner:
         logger.info(f"登录失败: {self.results['login_fail']}")
         logger.info(f"好友请求成功: {self.results['friend_success']}")
         logger.info(f"好友请求失败: {self.results['friend_fail']}")
+        logger.info(f"好友进度: {self.friend_index}/{len(self.friends)}")
         logger.info(f"详细结果已保存到: {self.result_file}")
         logger.info("=" * 60)
 
@@ -289,5 +313,6 @@ class TaskRunner:
     def save_results(self):
         """保存运行结果"""
         os.makedirs(config.LOG_DIR, exist_ok=True)
+        self.results["friend_index"] = self.friend_index
         with open(self.result_file, "w", encoding="utf-8") as f:
             json.dump(self.results, f, ensure_ascii=False, indent=2)
