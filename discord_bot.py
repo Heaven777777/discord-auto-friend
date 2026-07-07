@@ -107,17 +107,13 @@ class DiscordAutomator:
         try:
             self.d.shell("reboot")
             logger.info("模拟器重启指令已发送，等待启动...")
-            time.sleep(30)  # 等待模拟器重启
-            # 重连
-            for attempt in range(10):
-                try:
-                    self.d = u2.connect(self.serial)
-                    self.width, self.height = self.d.window_size()
-                    logger.info("模拟器重启完成，连接成功!")
-                    return True
-                except Exception:
-                    logger.info(f"等待模拟器启动... ({attempt+1}/10)")
-                    time.sleep(10)
+            time.sleep(10)
+            # 重连并轮询等待
+            self.d = u2.connect(self.serial)
+            if self._wait_for_device(timeout=80):
+                self.width, self.height = self.d.window_size()
+                logger.info("模拟器重启完成，连接成功!")
+                return True
             logger.error("模拟器重启超时，未能连接")
             return False
         except Exception as e:
@@ -502,9 +498,12 @@ class DiscordAutomator:
         self.screenshot(f"add_{username}")
         return False, "添加结果不明确"
 
-    def clear_input_and_go_back(self):
-        """清空输入框，准备添加下一个"""
-        input_el = self.d(className="android.widget.EditText")
-        if input_el.exists:
-            input_el.clear_text()
-            self.sleep(0.5)
+    def _wait_for_device(self, timeout=90):
+        """轮询等待模拟器重启完成"""
+        for _ in range(timeout):
+            try:
+                self.d.window_size()
+                return True
+            except Exception:
+                self.sleep(1)
+        return False
